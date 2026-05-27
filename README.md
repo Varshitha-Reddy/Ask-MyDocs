@@ -173,6 +173,3 @@ scripts/
 └── eval_ragas.py        RAGAS evaluation runner
 ```
 
-## License
-
-MIT
