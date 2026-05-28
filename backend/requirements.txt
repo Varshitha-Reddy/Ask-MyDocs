@@ -40,6 +40,11 @@ cohere==5.11.0
 ragas==0.1.21
 datasets==2.21.0
 
+# Celery — production task queue (replaces FastAPI BackgroundTasks)
+celery==5.4.0
+# flower — web UI to monitor Celery tasks (optional but useful)
+flower==2.0.1
+
 # Testing
 pytest==8.3.3
 pytest-asyncio==0.24.0

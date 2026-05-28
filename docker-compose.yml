@@ -41,6 +41,31 @@ services:
       redis:
         condition: service_healthy
 
+  # Celery worker — picks up ingestion tasks from Redis queue and runs them.
+  # Runs in a separate process so it survives FastAPI restarts and vice versa.
+  # Scale workers by adding: docker compose up --scale celery_worker=3
+  celery_worker:
+    build: ./backend
+    env_file: .env
+    # This command starts the Celery worker (not the FastAPI server)
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=2
+    depends_on:
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
+  # Flower — web UI to monitor Celery tasks at http://localhost:5555
+  # Shows: pending tasks, running tasks, completed tasks, retries, failures
+  flower:
+    build: ./backend
+    env_file: .env
+    command: celery -A app.core.celery_app.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - celery_worker
+
   # React frontend
   frontend:
     build: ./frontend

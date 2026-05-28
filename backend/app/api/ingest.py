@@ -1,80 +1,34 @@
 """
 Ingestion API — POST /ingest and GET /ingest/status/{job_id}
 
-Phase 4 upgrade: ingestion now runs as a background task.
-- POST /ingest returns a job_id immediately (no waiting).
-- The actual chunking + embedding + indexing happens in the background.
-- Client polls GET /ingest/status/{job_id} to check progress.
+Production upgrade: uses Celery instead of FastAPI BackgroundTasks.
 
-Why background tasks?
-- Large PDFs can take 30-60 seconds to ingest.
-- Blocking the HTTP request for that long times out browsers and proxies.
-- BackgroundTasks lets us respond in <100ms and do the work asynchronously.
+Why Celery?
+- BackgroundTasks: task lives in RAM. Server crashes → task lost, job stuck
+  at "pending" forever.
+- Celery: task is pushed to Redis queue before response is sent. If the
+  worker or server crashes, the task remains in Redis and gets picked up
+  when the worker restarts. Nothing is lost.
 """
 import os
 import tempfile
 import uuid
-from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from loguru import logger
 
-from app.core.job_store import create_job, get_job, update_job
-from app.ingestion.pipeline import run_ingestion_pipeline
+from app.core.job_store import create_job, get_job
 from app.models.schemas import IngestJobResponse, IngestStatusResponse
-from app.utils.metrics import INGESTED_CHUNKS_TOTAL, INGESTION_JOBS_TOTAL
+from app.tasks.ingest_task import ingest_document_task
 
 router = APIRouter()
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md"}
 
 
-async def _background_ingest(
-    job_id: str, tmp_path: str, original_filename: str, tenant_id: str
-) -> None:
-    """
-    Runs after the HTTP response is already sent.
-    Updates job status in Redis so the client can poll for progress.
-    """
-    await update_job(job_id, status="processing")
-    INGESTION_JOBS_TOTAL.labels(status="started").inc()
-
-    try:
-        result = await run_ingestion_pipeline(tmp_path, original_filename, tenant_id)
-
-        await update_job(
-            job_id,
-            status="done",
-            chunks_ingested=result.ingested,
-            finished_at=datetime.utcnow().isoformat(),
-        )
-        INGESTION_JOBS_TOTAL.labels(status="done").inc()
-        INGESTED_CHUNKS_TOTAL.inc(result.ingested)
-        logger.info(f"[{job_id}] Background ingestion done: {result.ingested} chunks")
-
-    except Exception as e:
-        await update_job(
-            job_id,
-            status="error",
-            error=str(e),
-            finished_at=datetime.utcnow().isoformat(),
-        )
-        INGESTION_JOBS_TOTAL.labels(status="error").inc()
-        logger.error(f"[{job_id}] Background ingestion failed: {e}")
-
-    finally:
-        # Clean up temp file here (not in the request handler) because the
-        # background task still needs it after the response is sent
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-
 @router.post("", response_model=IngestJobResponse, status_code=202)
 async def ingest_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    # X-Tenant-ID header isolates data between organisations.
-    # Defaults to "default" so single-tenant usage requires no changes.
     x_tenant_id: str = Header(default="default"),
 ):
     ext = os.path.splitext(file.filename)[1].lower()
@@ -85,17 +39,25 @@ async def ingest_document(
         )
 
     job_id = str(uuid.uuid4())
-    logger.info(
-        f"[{job_id}] Accepted '{file.filename}' for tenant '{x_tenant_id}'"
-    )
+    logger.info(f"[{job_id}] Accepted '{file.filename}' for tenant '{x_tenant_id}'")
 
+    # Save to temp file — Celery worker runs in a separate process and needs
+    # the file on disk (can't share memory with the FastAPI process)
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
+    # Create job record in Redis BEFORE dispatching the task.
+    # This way /status always returns something even if the worker is slow to start.
     await create_job(job_id, file.filename)
-    background_tasks.add_task(_background_ingest, job_id, tmp_path, file.filename, x_tenant_id)
+
+    # Push task to Celery queue (stored in Redis).
+    # .delay() is shorthand for .apply_async() — sends task to the queue immediately.
+    # The worker picks it up independently — even if this server process restarts.
+    ingest_document_task.delay(job_id, tmp_path, file.filename, x_tenant_id)
+
+    logger.info(f"[{job_id}] Task pushed to Celery queue")
 
     return IngestJobResponse(job_id=job_id, filename=file.filename, status="pending")
 
